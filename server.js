@@ -53,7 +53,7 @@ app.post('/api/create-payment', async (req, res) => {
       ],
       customer_email: email || undefined,
       metadata: { name, phone, address, notes: notes || '', quantity: String(qty) },
-      success_url: 'https://athar-gifts.com/thank-you.html',
+      success_url: `https://athar-gifts.com/thank-you.html?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&email=${encodeURIComponent(email||'')}&qty=${qty}&address=${encodeURIComponent(address)}&notes=${encodeURIComponent(notes||'')}&total=${qty*PRICE_PER_SET_AED}`,
       cancel_url: 'https://athar-gifts.com/index.html#order',
     });
 
