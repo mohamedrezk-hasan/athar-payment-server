@@ -15,15 +15,76 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
+const nodemailer = require('nodemailer');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
-
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY); // السر بيتحط هنا بس، مش في الموقع
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 // نسعّر المنتج هنا بأمان (السعر ميتحطش في المتصفح عشان محدش يغيّره)
 const PRICE_PER_SET_AED = 500; // السعر الرسمي للطقم
+
+// إعداد إرسال الإيميل عبر Gmail
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD,
+  },
+});
+
+async function sendOrderEmail(details) {
+  const { name, phone, email, quantity, address, notes, total } = details;
+  await transporter.sendMail({
+    from: `"أثر النخبة للهدايا" <${process.env.GMAIL_USER}>`,
+    to: 'info@athar-gifts.com',
+    subject: '✅ دفع ناجح - طلب جديد فنجان المؤسس',
+    text: `تم استلام دفعة جديدة!
+
+الاسم: ${name}
+الهاتف: ${phone}
+البريد: ${email || 'غير مذكور'}
+عدد الأطقم: ${quantity}
+الإجمالي المدفوع: ${total} درهم
+عنوان التوصيل: ${address}
+ملاحظات: ${notes || 'لا يوجد'}`,
+  });
+}
+
+// ⚠️ لازم express.raw هنا (قبل express.json) عشان Stripe يتأكد من توقيع الطلب
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const md = session.metadata || {};
+    try {
+      await sendOrderEmail({
+        name: md.name,
+        phone: md.phone,
+        email: session.customer_details?.email || '',
+        quantity: md.quantity,
+        address: md.address,
+        notes: md.notes,
+        total: (session.amount_total / 100),
+      });
+      console.log('Order email sent for session', session.id);
+    } catch (e) {
+      console.error('Failed to send order email:', e);
+    }
+  }
+
+  res.json({ received: true });
+});
+
+app.use(cors());
+app.use(express.json());
 
 app.post('/api/create-payment', async (req, res) => {
   try {
