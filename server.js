@@ -15,7 +15,6 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const Stripe = require('stripe');
-const nodemailer = require('nodemailer');
 
 const app = express();
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
@@ -23,22 +22,10 @@ const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 // نسعّر المنتج هنا بأمان (السعر ميتحطش في المتصفح عشان محدش يغيّره)
 const PRICE_PER_SET_AED = 500; // السعر الرسمي للطقم
 
-// إعداد إرسال الإيميل عبر Gmail
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
-});
-
+// إرسال إيميل تلقائي عبر Resend
 async function sendOrderEmail(details) {
   const { name, phone, email, quantity, address, notes, total } = details;
-  await transporter.sendMail({
-    from: `"أثر النخبة للهدايا" <${process.env.GMAIL_USER}>`,
-    to: 'info@athar-gifts.com',
-    subject: '✅ دفع ناجح - طلب جديد فنجان المؤسس',
-    text: `تم استلام دفعة جديدة!
+  const text = `تم استلام دفعة جديدة!
 
 الاسم: ${name}
 الهاتف: ${phone}
@@ -46,8 +33,25 @@ async function sendOrderEmail(details) {
 عدد الأطقم: ${quantity}
 الإجمالي المدفوع: ${total} درهم
 عنوان التوصيل: ${address}
-ملاحظات: ${notes || 'لا يوجد'}`,
+ملاحظات: ${notes || 'لا يوجد'}`;
+
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: 'أثر النخبة للهدايا <onboarding@resend.dev>',
+      to: process.env.NOTIFY_EMAIL, // إيميلك اللي سجلت بيه في Resend
+      subject: '✅ دفع ناجح - طلب جديد فنجان المؤسس',
+      text,
+    }),
   });
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error('Resend error: ' + errText);
+  }
 }
 
 // ⚠️ لازم express.raw هنا (قبل express.json) عشان Stripe يتأكد من توقيع الطلب
