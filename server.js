@@ -3,7 +3,7 @@
  * ============================================================================
  * الجديد في النسخة دي:
  *   ✅ أنواع منتجات متعددة (PRODUCTS)
- *   ✅ أكواد خصم بصلاحية وحد أدنى للكمية وحد أقصى للاستخدام (PROMOS)
+ *   ✅ أكواد خصم — بتتدار من لوحة Stripe مباشرة
  *   ✅ نقطة /api/products — الموقع بيجيب منها الأسعار (مصدر واحد للحقيقة)
  *   ✅ نقطة /api/validate-promo — التحقق من الكود قبل الدفع
  *   ✅ CORS مقفول على athar-gifts.com بس
@@ -54,23 +54,23 @@ const PRODUCTS = {
 };
 
 /* ==========================================================================
-   ⚙️  ٢ — أكواد الخصم  ←←← عدّل من هنا
-   type: 'percent' = نسبة مئوية  |  'fixed' = مبلغ ثابت بالدرهم
+   🎟️  ٢ — أكواد الخصم — بتتدار من لوحة Stripe مباشرة
+   --------------------------------------------------------------------------
+   مفيش أكواد مكتوبة في الملف ده. Stripe هو اللي بيتحقق ويعدّ الاستخدامات،
+   فالعدّاد مضمون ومش بيرجع صفر لما السيرفر ينام.
+
+   عشان تعمل كود جديد:
+     Stripe Dashboard → Product catalog → Coupons → Create coupon
+       • النوع: Percentage discount أو Fixed amount discount (AED)
+       • Duration: Once
+     وبعدين جوه الكوبون: Add promotion code → واكتب الكود (مثلاً ATHAR10)
+       • Limit the number of times... ← عدد الاستخدامات الكلي
+       • Limit to first-time customers / one per customer ← لو حبيت
+       • Expiry date ← تاريخ الانتهاء
+
+   عشان توقف كود: افتحه في Stripe ودوس Deactivate. بيتوقف فوراً،
+   من غير أي تعديل كود ولا Deploy.
    ========================================================================== */
-const PROMOS = {
-  'ATHAR10': {
-    type: 'percent',
-    value: 10,
-    label: 'خصم ١٠٪',
-    expires: '2026-12-31',      // آخر يوم صلاحية
-    minQty: 1,                  // أقل كمية
-    maxUses: 100,               // 0 = بلا حد
-    used: 0,
-  },
-  // مثال لخصم مؤسسي بمبلغ ثابت:
-  // 'ERTH500': { type:'fixed', value:500, label:'خصم ٥٠٠ درهم',
-  //              expires:'2026-12-31', minQty:5, maxUses:20, used:0 },
-};
 
 /* ========================================================================== */
 
@@ -96,21 +96,50 @@ app.use(cors({
 /* --------------------------------------------------------------------------
    الحسبة — المرجع الوحيد للمبلغ المحصّل
    -------------------------------------------------------------------------- */
-function validatePromo(code, qty) {
+/* بيسأل Stripe عن الكود. Stripe بيرجّع الكود بس لو لسه فعّال
+   (مش منتهي، ومستهلكش الحد الأقصى للاستخدامات). */
+async function validatePromo(code) {
   if (!code) return { valid: false };
   const key = String(code).trim().toUpperCase();
-  const p = PROMOS[key];
-  if (!p) return { valid: false, reason: 'كود غير موجود' };
-  if (p.expires && new Date() > new Date(p.expires + 'T23:59:59'))
-    return { valid: false, reason: 'الكود منتهي الصلاحية' };
-  if (p.minQty && qty < p.minQty)
-    return { valid: false, reason: `الكود يبدأ من ${p.minQty} أطقم` };
-  if (p.maxUses && p.used >= p.maxUses)
-    return { valid: false, reason: 'الكود استُهلك بالكامل' };
-  return { valid: true, key, type: p.type, value: p.value, label: p.label };
+
+  try {
+    const list = await stripe.promotionCodes.list({
+      code: key,
+      active: true,
+      limit: 1,
+      expand: ['data.coupon'],
+    });
+
+    if (!list.data.length)
+      return { valid: false, reason: 'كود غير صحيح أو منتهي الصلاحية' };
+
+    const pc = list.data[0];
+    const c = pc.coupon;
+
+    if (!c.valid)
+      return { valid: false, reason: 'الكود لم يعد صالحاً' };
+
+    // Stripe بيرجّع المبلغ بالفلس — نحوّله لدراهم
+    const isPercent = c.percent_off != null;
+
+    return {
+      valid: true,
+      key,
+      promotionCodeId: pc.id,
+      type:  isPercent ? 'percent' : 'fixed',
+      value: isPercent ? c.percent_off : (c.amount_off / 100),
+      label: c.name || key,
+      minAmount: pc.restrictions?.minimum_amount
+        ? pc.restrictions.minimum_amount / 100
+        : null,
+    };
+  } catch (err) {
+    console.error('Stripe promo lookup failed:', err.message);
+    return { valid: false, reason: 'تعذر التحقق من الكود' };
+  }
 }
 
-function priceOrder({ productId, quantity, promoCode }) {
+async function priceOrder({ productId, quantity, promoCode }) {
   const product = PRODUCTS[productId];
   if (!product || !product.active) throw new Error('منتج غير متاح');
   if (!product.price || product.price <= 0) throw new Error('سعر المنتج غير محدد');
@@ -118,19 +147,21 @@ function priceOrder({ productId, quantity, promoCode }) {
   const qty = Math.max(1, Math.min(500, Number(quantity) || 1));
   const subtotal = product.price * qty;
 
-  let discount = 0, promoLabel = null, promoKey = null;
-  const chk = validatePromo(promoCode, qty);
-  if (chk.valid) {
+  let discount = 0, promoLabel = null, promoKey = null, promotionCodeId = null;
+  const chk = await validatePromo(promoCode);
+
+  if (chk.valid && (!chk.minAmount || subtotal >= chk.minAmount)) {
     discount = chk.type === 'percent'
       ? Math.round(subtotal * (chk.value / 100))
       : Math.min(chk.value, subtotal);
     promoLabel = chk.label;
     promoKey = chk.key;
+    promotionCodeId = chk.promotionCodeId;
   }
 
   return {
     product, productId, qty, subtotal,
-    discount, promoLabel, promoKey,
+    discount, promoLabel, promoKey, promotionCodeId,
     total: Math.max(0, subtotal - discount),
   };
 }
@@ -186,8 +217,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     const session = event.data.object;
     const md = session.metadata || {};
 
-    // ✅ نسجّل استخدام الكود بعد ما الدفع ينجح فعلاً (مش قبله)
-    if (md.promoKey && PROMOS[md.promoKey]) PROMOS[md.promoKey].used++;
+    // عدّاد استخدام الكود بيتحدّث في Stripe تلقائياً — مفيش عدّ يدوي هنا
 
     try {
       await sendOrderEmail({
@@ -231,9 +261,18 @@ app.get('/api/products', (req, res) => {
 /* --------------------------------------------------------------------------
    /api/validate-promo — التحقق من الكود
    -------------------------------------------------------------------------- */
-app.post('/api/validate-promo', (req, res) => {
-  const { code, quantity } = req.body || {};
-  const r = validatePromo(code, Number(quantity) || 1);
+app.post('/api/validate-promo', async (req, res) => {
+  const { code, productId, quantity } = req.body || {};
+  const r = await validatePromo(code);
+
+  // لو الكوبون له حد أدنى للمبلغ، نتأكد إن الطلب يوصله
+  if (r.valid && r.minAmount) {
+    const p = PRODUCTS[productId || 'founder-6'];
+    const sub = (p ? p.price : 0) * (Number(quantity) || 1);
+    if (sub < r.minAmount)
+      return res.json({ valid: false, reason: `الكود يبدأ من ${r.minAmount} درهم` });
+  }
+
   res.json({ valid: r.valid, type: r.type, value: r.value, label: r.label, reason: r.reason });
 });
 
@@ -250,20 +289,12 @@ app.post('/api/create-payment', async (req, res) => {
     }
 
     // 💰 الحساب على السيرفر — الصفحة بعتت أسماء بس
-    const o = priceOrder({ productId: productId || 'founder-6', quantity, promoCode });
+    const o = await priceOrder({ productId: productId || 'founder-6', quantity, promoCode });
 
-    // الخصم بيتعمل ككوبون Stripe عشان يبان للعميل في صفحة الدفع
-    let discounts = [];
-    if (o.discount > 0) {
-      const coupon = await stripe.coupons.create({
-        amount_off: Math.round(o.discount * 100),
-        currency: 'aed',
-        duration: 'once',
-        name: o.promoLabel,
-        max_redemptions: 1,
-      });
-      discounts = [{ coupon: coupon.id }];
-    }
+    // بنمرر كود الخصم نفسه لـ Stripe — هو اللي بيطبّقه ويعدّ الاستخدام
+    const discounts = o.promotionCodeId
+      ? [{ promotion_code: o.promotionCodeId }]
+      : [];
 
     const session = await stripe.checkout.sessions.create({
       mode: 'payment',
@@ -311,6 +342,7 @@ app.listen(PORT, () => {
   console.log(`📬 المستقبِل: ${NOTIFY_TO.join(', ') || '⚠️ غير محدد — NOTIFY_EMAIL فاضي!'}`);
   if (!process.env.RESEND_FROM)
     console.warn('⚠️  RESEND_FROM مش متظبط — الإيميلات بتتبعت من العنوان التجريبي وممكن تروح Junk');
+  console.log('🎟️  أكواد الخصم بتتدار من لوحة Stripe → Product catalog → Coupons');
   const bad = Object.entries(PRODUCTS).filter(([, p]) => p.active && !(p.price > 0));
   if (bad.length)
     console.warn('⚠️  منتجات مفعّلة بدون سعر:', bad.map(([id]) => id).join(', '));
